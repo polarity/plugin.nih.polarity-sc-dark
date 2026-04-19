@@ -1,0 +1,134 @@
+name: Build Plugin Binaries
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "*"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # GitHub's default sh on Linux does not support the array syntax below.
+    shell: bash
+
+jobs:
+  package:
+    name: Package plugin binaries
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04
+            os: ubuntu-22.04
+            cross-target: ""
+          - name: macos-universal
+            os: macos-latest
+            cross-target: x86_64-apple-darwin
+          - name: windows
+            os: windows-latest
+            cross-target: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libgl-dev \
+            libjack-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-dri2-0-dev \
+            libxcb-icccm4-dev \
+            libxcursor-dev \
+            libxkbcommon-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Cache Cargo registry
+        if: startsWith(matrix.os, 'windows')
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ matrix.name }}-${{ matrix.cross-target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.name }}-${{ matrix.cross-target }}-
+
+      - name: Cache Cargo registry and target
+        if: "!startsWith(matrix.os, 'windows')"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.name }}-${{ matrix.cross-target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.name }}-${{ matrix.cross-target }}-
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          # The universal macOS bundle is built from x86_64 and AArch64 artifacts.
+          targets: ${{ matrix.cross-target }}
+
+      - name: Clean previous plugin bundles
+        run: rm -rf target/bundled
+
+      - name: Package all targets from bundler.toml
+        run: |
+          package_args=()
+          for package in $(cargo xtask known-packages); do
+            package_args+=("-p" "$package")
+          done
+
+          runner_name=${{ matrix.name }}
+          if [[ $runner_name = "macos-universal" ]]; then
+            export MACOSX_DEPLOYMENT_TARGET=10.13
+            cargo xtask bundle-universal "${package_args[@]}" --release
+          else
+            cross_target=${{ matrix.cross-target }}
+            if [[ -n $cross_target ]]; then
+              package_args+=("--target" "$cross_target")
+            fi
+
+            cargo xtask bundle "${package_args[@]}" --release
+          fi
+
+      - name: Determine archive name
+        run: |
+          echo "ARCHIVE_NAME=polarity-sc-dark-$(date -u +"%Y-%m-%d-%H%M%S")-${{ matrix.name }}" >> "$GITHUB_ENV"
+
+      - name: Stage packaged plugin artifacts
+        run: |
+          mkdir -p "$ARCHIVE_NAME/$ARCHIVE_NAME"
+          mv target/bundled/* "$ARCHIVE_NAME/$ARCHIVE_NAME"
+
+      - name: Add installation README
+        run: cp ".github/workflows/readme-${{ runner.os }}.txt" "$ARCHIVE_NAME/$ARCHIVE_NAME/README.txt"
+
+      - name: Upload packaged plugin artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: ${{ env.ARCHIVE_NAME }}

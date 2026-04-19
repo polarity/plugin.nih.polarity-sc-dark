@@ -1,0 +1,8 @@
+# Bundler metadata for the single plugin shipped by this repository.
+# This file's syntax is as follows:
+#
+# [package_name]
+# name = "Human Readable Plugin Name"  # defaults to <package_name>
+
+[polarity_sc_dark]
+name = "Polarity-SC-Dark"

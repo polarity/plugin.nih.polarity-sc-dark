@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "plugin",
+  "framework/nih_plug",
+  "framework/nih_plug_derive",
+  "framework/nih_plug_vizia",
+  "framework/nih_plug_xtask",
+  "framework/cargo_nih_plug",
+  "framework/xtask",
+]
+
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
