@@ -124,15 +124,14 @@ pub struct SpectralCompressorParams {
 /// Global parameters controlling the output stage and all compressors.
 #[derive(Params)]
 pub struct GlobalParams {
-    /// Makeup gain applied after dry/wet mixing or bypass. If automatic makeup gain is enabled,
-    /// then this acts as an offset on top of that. This is stored as linear gain.
+    /// Makeup gain applied to the processed signal before dry/wet mixing. This is stored as linear
+    /// gain.
     #[id = "output"]
     pub output_gain: FloatParam,
     /// Skip the compressor processing path while keeping the final output gain active.
     #[id = "bypass"]
     pub bypass: BoolParam,
-    /// How much of the dry signal to mix in with the processed signal. The final output gain is
-    /// applied after this mix.
+    /// How much of the dry signal to mix in with the output-gained processed signal.
     #[id = "dry_wet"]
     pub dry_wet_ratio: FloatParam,
 
@@ -522,6 +521,17 @@ impl Plugin for SpectralCompressor {
             let latency = self.stft.latency_samples() as usize;
             self.dry_wet_mixer.subtract_from_dry(buffer, latency);
         } else {
+            if let Some(result) = self
+                .match_meter
+                .measure_output_and_finish(buffer, match_frames)
+            {
+                self.match_runtime.publish_result(result);
+            }
+
+            if !bypass_active || match_active {
+                apply_output_gain(buffer, final_output_gain);
+            }
+
             if bypass_active && !match_active {
                 self.dry_wet_mixer.mix_in_dry(
                     buffer,
@@ -538,21 +548,6 @@ impl Plugin for SpectralCompressor {
                         .next_step(buffer.samples() as u32),
                     self.stft.latency_samples() as usize,
                 );
-            }
-
-            if let Some(result) = self
-                .match_meter
-                .measure_output_and_finish(buffer, match_frames)
-            {
-                self.match_runtime.publish_result(result);
-            }
-
-            // Bypass skips the output gain so users can A/B the gained processed
-            // signal against the untouched dry signal. The match measurement is
-            // driven from the output buffer, so we still apply gain while match is
-            // active even if bypass was (briefly) left on when Match was clicked.
-            if !bypass_active || match_active {
-                apply_output_gain(buffer, final_output_gain);
             }
         }
 
@@ -648,15 +643,14 @@ fn process_stft_main(
 
     // Apply the window function once more to reduce time domain aliasing. The synthesis gain
     // compensates for the squared Hann window that would be applied if we didn't do any processing
-    // at all as well as the FFT+IFFT itself. User output gain is applied after dry/wet or bypass.
+    // at all as well as the FFT+IFFT itself.
     for (sample, window_sample) in real_fft_buffer.iter_mut().zip(config.window_function) {
         *sample *= window_sample * config.synthesis_gain;
     }
 }
 
-/// Applies a final post-mix linear gain to every output sample in `buffer`. Match writes
-/// its result straight into the Output Gain parameter, so the value is already in linear
-/// space by the time we get here.
+/// Applies a linear gain to every output sample in `buffer`. Match writes its result straight into
+/// the Output Gain parameter, so the value is already in linear space by the time we get here.
 fn apply_output_gain(buffer: &mut Buffer, output_gain: f32) {
     const UNITY_GAIN_EPSILON: f32 = 1.0e-6;
     if (output_gain - 1.0).abs() <= UNITY_GAIN_EPSILON {
@@ -690,6 +684,44 @@ mod tests {
 
         assert_eq!(left, vec![2.0, -4.0]);
         assert_eq!(right, vec![1.0, -0.5]);
+    }
+
+    #[test]
+    fn output_gain_only_scales_wet_mix_branch() {
+        assert_eq!(mix_with_output_gain(1.0, 0.5, 2.0, 0.0), 1.0);
+        assert_eq!(mix_with_output_gain(1.0, 0.5, 2.0, 0.5), 1.0);
+        assert_eq!(mix_with_output_gain(1.0, 0.5, 2.0, 1.0), 1.0);
+    }
+
+    fn mix_with_output_gain(dry: f32, wet: f32, gain: f32, ratio: f32) -> f32 {
+        let mut dry_sample = vec![dry];
+        let mut wet_sample = vec![wet];
+        let mut mixer = dry_wet_mixer::DryWetMixer::new(1, 1, 0);
+
+        {
+            let mut buffer = Buffer::default();
+            unsafe {
+                buffer.set_slices(1, |output_slices| {
+                    *output_slices = vec![dry_sample.as_mut_slice()];
+                });
+            }
+
+            mixer.write_dry(&buffer);
+        }
+
+        {
+            let mut buffer = Buffer::default();
+            unsafe {
+                buffer.set_slices(1, |output_slices| {
+                    *output_slices = vec![wet_sample.as_mut_slice()];
+                });
+            }
+
+            apply_output_gain(&mut buffer, gain);
+            mixer.mix_in_dry(&mut buffer, ratio, 0);
+        }
+
+        wet_sample[0]
     }
 }
 
@@ -746,4 +778,3 @@ impl Vst3Plugin for SpectralCompressor {
 
 nih_export_clap!(SpectralCompressor);
 nih_export_vst3!(SpectralCompressor);
-
