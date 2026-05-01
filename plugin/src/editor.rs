@@ -234,10 +234,26 @@ fn header_bar(cx: &mut Context) {
             Label::new(cx, "Polarity-SC")
                 .class("plugin-title")
                 .on_mouse_down(|_, _| {
-                    let result = open::that(SpectralCompressor::URL);
-                    if cfg!(debug_assertions) && result.is_err() {
-                        nih_debug_assert_failure!("Failed to open web browser: {:?}", result);
+                    // `CARGO_PKG_HOMEPAGE` is `""` when no `homepage` is set in
+                    // Cargo.toml, and `open::that("")` opens Explorer in the
+                    // current working directory on Windows.
+                    let url = SpectralCompressor::URL;
+                    if url.is_empty() {
+                        return;
                     }
+                    // Spawn on a background thread: on Windows, `open::that`
+                    // ultimately calls `ShellExecuteW`, which can hang or crash
+                    // when invoked from a plugin host's UI thread (COM apartment
+                    // mismatches, reentrant message pumping, etc.).
+                    std::thread::spawn(move || {
+                        let result = open::that(url);
+                        if cfg!(debug_assertions) && result.is_err() {
+                            nih_debug_assert_failure!(
+                                "Failed to open web browser: {:?}",
+                                result
+                            );
+                        }
+                    });
                 });
             Label::new(cx, SpectralCompressor::VERSION).class("version-label");
         })

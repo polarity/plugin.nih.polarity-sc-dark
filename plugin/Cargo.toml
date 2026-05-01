@@ -4,6 +4,7 @@ version = "0.5.2"
 edition = "2021"
 authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>", "Robert Polarity Agthe <hey@polarity.productions>"]
 license = "GPL-3.0-or-later"
+homepage = "https://polarity.productions/polarity-sc/"
 
 [lib]
 crate-type = ["lib", "cdylib"]
