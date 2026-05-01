@@ -281,55 +281,38 @@ fn global_column(cx: &mut Context) {
         } else if name == "Freeze" {
             HStack::new(cx, |cx| {
                 Label::new(cx, name).class("label");
-                ParamButton::new(cx, global_params, |params| &params.compressor_freeze)
-                    .with_label("Freeze")
-                    .class("export-button");
+                HStack::new(cx, |cx| {
+                    ParamButton::new(cx, global_params, |params| &params.compressor_freeze)
+                        .with_label("Freeze")
+                        .class("freeze-button");
+                    ExportIrButton::new(cx, Data::frozen_ir_data, "Export IR...")
+                        .disabled(ExportUiModel::can_export.map(|can_export| !*can_export))
+                        .class("freeze-button");
+                })
+                .class("freeze-button-group");
             })
             .class("row");
         }
     });
 }
 
-/// Renders threshold parameters plus IR export controls.
+/// Renders threshold parameters.
 fn threshold_column(cx: &mut Context) {
     let threshold_params = Data::params.map(|p| p.threshold.clone());
 
     GenericUi::new_custom(cx, threshold_params, |cx, param_ptr| {
         let name = unsafe { param_ptr.name() };
 
-        if name == "SC Channel Link" {
-            VStack::new(cx, |cx| {
-                HStack::new(cx, |cx| {
-                    Label::new(cx, name).class("label");
-                    GenericUi::draw_widget(cx, threshold_params, param_ptr);
-                })
-                .class("row");
+        HStack::new(cx, |cx| {
+            Label::new(cx, name).class("label");
 
-                HStack::new(cx, |cx| {
-                    Label::new(cx, "IR Export").class("label");
-                    ExportIrButton::new(
-                        cx,
-                        Data::frozen_ir_data,
-                        "Export IR...",
-                    )
-                    .disabled(ExportUiModel::can_export.map(|can_export| !*can_export))
-                    .class("export-button");
-                })
-                .class("row");
-            })
-            .class("export-group");
-        } else {
-            HStack::new(cx, |cx| {
-                Label::new(cx, name).class("label");
-
-                if name == "Mode" {
-                    mode_picklist(cx);
-                } else {
-                    GenericUi::draw_widget(cx, threshold_params, param_ptr);
-                }
-            })
-            .class("row");
-        }
+            if name == "Mode" {
+                mode_picklist(cx);
+            } else {
+                GenericUi::draw_widget(cx, threshold_params, param_ptr);
+            }
+        })
+        .class("row");
     });
 }
 
@@ -386,7 +369,7 @@ fn downwards_column(cx: &mut Context) {
 
 /// Creates the analyzer panel on the right side of the editor.
 fn analyzer_column(cx: &mut Context) {
-    Analyzer::new(cx, Data::analyzer_data, Data::sample_rate);
+    Analyzer::new(cx, Data::analyzer_data, Data::sample_rate, Data::params);
 }
 
 /// Custom threshold mode selector that writes raw parameter automation events.

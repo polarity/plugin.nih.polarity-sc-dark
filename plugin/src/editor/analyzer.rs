@@ -17,19 +17,33 @@
 use atomic_float::AtomicF32;
 use atomic_refcell::AtomicRefCell;
 use nih_plug::nih_debug_assert;
+use nih_plug::prelude::Param;
+use nih_plug_vizia::assets;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::vg;
+use nih_plug_vizia::widgets::RawParamEvent;
+use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::analyzer::AnalyzerData;
-use crate::curve::Curve;
+use crate::curve::{
+    Curve, CurvePoint, THRESHOLD_CURVE_MAX_FREQUENCY_HZ, THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
+    THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
+};
+use crate::SpectralCompressorParams;
 
 use super::theme;
 
 const LN_FREQ_RANGE_START_HZ: f32 = 3.4011974; // 30.0f32.ln();
 const LN_FREQ_RANGE_END_HZ: f32 = 9.998797; // 22_000.0f32.ln();
 const LN_FREQ_RANGE: f32 = LN_FREQ_RANGE_END_HZ - LN_FREQ_RANGE_START_HZ;
+const FREQUENCY_GUIDES: [(f32, &str); 4] = [
+    (30.0, "30 Hz"),
+    (100.0, "100 Hz"),
+    (1_000.0, "1 kHz"),
+    (10_000.0, "10 kHz"),
+];
 
 // All analyzer colors are defined in `theme.rs`.
 
@@ -38,6 +52,10 @@ const LN_FREQ_RANGE: f32 = LN_FREQ_RANGE_END_HZ - LN_FREQ_RANGE_START_HZ;
 pub struct Analyzer {
     analyzer_data: Arc<AtomicRefCell<triple_buffer::Output<AnalyzerData>>>,
     sample_rate: Arc<AtomicF32>,
+    params: Arc<SpectralCompressorParams>,
+    frequency_guide_label_font: Cell<Option<vg::FontId>>,
+    selected_point_index: Option<usize>,
+    drag_active: bool,
 }
 
 impl Analyzer {
@@ -46,6 +64,7 @@ impl Analyzer {
         cx: &mut Context,
         analyzer_data: LAnalyzerData,
         sample_rate: LRate,
+        params: impl Lens<Target = Arc<SpectralCompressorParams>>,
     ) -> Handle<'_, Self>
     where
         LAnalyzerData: Lens<Target = Arc<AtomicRefCell<triple_buffer::Output<AnalyzerData>>>>,
@@ -54,6 +73,10 @@ impl Analyzer {
         Self {
             analyzer_data: analyzer_data.get(cx),
             sample_rate: sample_rate.get(cx),
+            params: params.get(cx),
+            frequency_guide_label_font: Cell::new(None),
+            selected_point_index: None,
+            drag_active: false,
         }
         .build(
             cx,
@@ -61,11 +84,231 @@ impl Analyzer {
             |_cx| (),
         )
     }
+
+    fn begin_drag(&mut self, cx: &mut EventContext, point_index: usize) {
+        self.selected_point_index = Some(point_index);
+        self.drag_active = true;
+
+        let point = &self.params.threshold.curve_points[point_index];
+        Self::emit_begin(cx, &point.frequency);
+        Self::emit_begin(cx, &point.offset_db);
+    }
+
+    fn finish_drag(&mut self, cx: &mut EventContext) {
+        if let Some(point_index) = self.selected_point_index {
+            let point = &self.params.threshold.curve_points[point_index];
+            Self::emit_end(cx, &point.frequency);
+            Self::emit_end(cx, &point.offset_db);
+        }
+
+        self.selected_point_index = None;
+        self.drag_active = false;
+        cx.release();
+        cx.set_active(false);
+    }
+
+    fn first_free_point_index(&self) -> Option<usize> {
+        self.params
+            .threshold
+            .curve_points
+            .iter()
+            .position(|point| !point.enabled.value())
+    }
+
+    fn set_point_enabled(&self, cx: &mut EventContext, point_index: usize, enabled: bool) {
+        let point = &self.params.threshold.curve_points[point_index];
+        Self::emit_begin(cx, &point.enabled);
+        Self::emit_set(cx, &point.enabled, enabled);
+        Self::emit_end(cx, &point.enabled);
+    }
+
+    fn set_point_position(
+        &self,
+        cx: &mut EventContext,
+        point_index: usize,
+        frequency: f32,
+        offset_db: f32,
+    ) {
+        let point = &self.params.threshold.curve_points[point_index];
+        Self::emit_set(cx, &point.frequency, frequency);
+        Self::emit_set(cx, &point.offset_db, offset_db);
+    }
+
+    fn hit_test_point(
+        &self,
+        bounds: BoundingBox,
+        x: f32,
+        y: f32,
+        scale_factor: f32,
+    ) -> Option<usize> {
+        if bounds.w <= 0.0 || bounds.h <= 0.0 {
+            return None;
+        }
+
+        let curve_params = self.params.threshold.curve_params();
+        let curve = Curve::new(&curve_params);
+        let display_offset_db = self.editable_curve_display_offset_db();
+        let hit_radius = scale_factor * 8.0;
+        let max_distance_squared = hit_radius * hit_radius;
+        let mut nearest = None;
+
+        for (index, point) in curve_params.points.iter().enumerate() {
+            let Some((point_x, point_y)) =
+                point_screen_position(bounds, &curve, point, display_offset_db)
+            else {
+                continue;
+            };
+
+            let dx = x - point_x;
+            let dy = y - point_y;
+            let distance_squared = (dx * dx) + (dy * dy);
+            if distance_squared <= max_distance_squared
+                && nearest
+                    .map(|(_, nearest_distance_squared)| {
+                        distance_squared < nearest_distance_squared
+                    })
+                    .unwrap_or(true)
+            {
+                nearest = Some((index, distance_squared));
+            }
+        }
+
+        nearest.map(|(index, _)| index)
+    }
+
+    fn screen_to_point_values(&self, bounds: BoundingBox, x: f32, y: f32) -> (f32, f32) {
+        let x_t = if bounds.w <= 0.0 {
+            0.0
+        } else {
+            ((x - bounds.x) / bounds.w).clamp(0.0, 1.0)
+        };
+        let y_t = if bounds.h <= 0.0 {
+            0.0
+        } else {
+            (1.0 - ((y - bounds.y) / bounds.h)).clamp(0.0, 1.0)
+        };
+
+        let ln_freq = LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * x_t);
+        let frequency = ln_freq.exp().clamp(
+            THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
+            THRESHOLD_CURVE_MAX_FREQUENCY_HZ,
+        );
+        let clicked_db = unclamped_t_to_db(y_t);
+        let curve_params = self.params.threshold.curve_params();
+        let curve = Curve::new(&curve_params);
+        let offset_db = (clicked_db
+            - self.editable_curve_display_offset_db()
+            - curve.evaluate_base_ln(ln_freq))
+        .clamp(
+            -THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
+            THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
+        );
+
+        (frequency, offset_db)
+    }
+
+    fn editable_curve_display_offset_db(&self) -> f32 {
+        let upwards_offset_db = self.params.compressors.upwards.threshold_offset_db.value();
+        let downwards_offset_db = self
+            .params
+            .compressors
+            .downwards
+            .threshold_offset_db
+            .value();
+
+        (upwards_offset_db + downwards_offset_db) * 0.5
+    }
+
+    fn emit_begin<P: Param>(cx: &mut EventContext, param: &P) {
+        cx.emit(RawParamEvent::BeginSetParameter(param.as_ptr()));
+    }
+
+    fn emit_set<P: Param>(cx: &mut EventContext, param: &P, value: P::Plain) {
+        cx.emit(RawParamEvent::SetParameterNormalized(
+            param.as_ptr(),
+            param.preview_normalized(value),
+        ));
+    }
+
+    fn emit_end<P: Param>(cx: &mut EventContext, param: &P) {
+        cx.emit(RawParamEvent::EndSetParameter(param.as_ptr()));
+    }
 }
 
 impl View for Analyzer {
     fn element(&self) -> Option<&'static str> {
         Some("analyzer")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, meta| match window_event {
+            WindowEvent::MouseDown(MouseButton::Left)
+            | WindowEvent::MouseDoubleClick(MouseButton::Left)
+            | WindowEvent::MouseTripleClick(MouseButton::Left) => {
+                if self.drag_active {
+                    self.finish_drag(cx);
+                    meta.consume();
+                    return;
+                }
+
+                let bounds = cx.bounds();
+                let x = cx.mouse().cursorx;
+                let y = cx.mouse().cursory;
+
+                if let Some(point_index) = self.hit_test_point(bounds, x, y, cx.scale_factor()) {
+                    self.begin_drag(cx, point_index);
+                } else if let Some(point_index) = self.first_free_point_index() {
+                    let (frequency, offset_db) = self.screen_to_point_values(bounds, x, y);
+                    self.set_point_enabled(cx, point_index, true);
+                    self.begin_drag(cx, point_index);
+                    self.set_point_position(cx, point_index, frequency, offset_db);
+                } else {
+                    meta.consume();
+                    return;
+                }
+
+                cx.capture();
+                cx.focus();
+                cx.set_active(true);
+                meta.consume();
+            }
+            WindowEvent::MouseDown(MouseButton::Right)
+            | WindowEvent::MouseDoubleClick(MouseButton::Right)
+            | WindowEvent::MouseTripleClick(MouseButton::Right) => {
+                if self.drag_active {
+                    self.finish_drag(cx);
+                    meta.consume();
+                    return;
+                }
+
+                let bounds = cx.bounds();
+                let x = cx.mouse().cursorx;
+                let y = cx.mouse().cursory;
+
+                if let Some(point_index) = self.hit_test_point(bounds, x, y, cx.scale_factor()) {
+                    self.set_point_enabled(cx, point_index, false);
+                    meta.consume();
+                }
+            }
+            WindowEvent::MouseUp(MouseButton::Left) => {
+                if self.drag_active {
+                    self.finish_drag(cx);
+                    meta.consume();
+                }
+            }
+            WindowEvent::MouseMove(x, y) => {
+                if self.drag_active {
+                    if let Some(point_index) = self.selected_point_index {
+                        let bounds = cx.bounds();
+                        let (frequency, offset_db) = self.screen_to_point_values(bounds, *x, *y);
+                        self.set_point_position(cx, point_index, frequency, offset_db);
+                    }
+
+                    meta.consume();
+                }
+            }
+            _ => {}
+        });
     }
 
     fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
@@ -80,6 +323,8 @@ impl View for Analyzer {
         bg_path.rect(bounds.x, bounds.y, bounds.w, bounds.h);
         canvas.fill_path(&bg_path, &vg::Paint::color(theme::ANALYZER_BACKGROUND));
 
+        draw_frequency_guide_lines(cx, canvas);
+
         // The analyzer data is pulled directly from the spectral `CompressorBank`
         let Ok(mut analyzer_data) = self.analyzer_data.try_borrow_mut() else {
             return;
@@ -90,6 +335,13 @@ impl View for Analyzer {
         draw_spectrum(cx, canvas, analyzer_data, nyquist);
         draw_threshold_curve(cx, canvas, analyzer_data);
         draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
+        let label_font = self.frequency_guide_label_font.get().or_else(|| {
+            canvas
+                .add_font_mem(assets::fonts::NOTO_SANS_LIGHT)
+                .ok()
+                .inspect(|font_id| self.frequency_guide_label_font.set(Some(*font_id)))
+        });
+        draw_frequency_guide_labels(cx, canvas, label_font);
 
         // Draw the border last
         let border_width = cx.border_width();
@@ -118,6 +370,121 @@ impl View for Analyzer {
 #[inline]
 fn db_to_unclamped_t(db_value: f32) -> f32 {
     (db_value + 80.0) / 100.0
+}
+
+#[inline]
+fn unclamped_t_to_db(t: f32) -> f32 {
+    (t * 100.0) - 80.0
+}
+
+fn editable_curve_display_offset_db(analyzer_data: &AnalyzerData) -> f32 {
+    let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
+    (upwards_offset_db + downwards_offset_db) * 0.5
+}
+
+#[inline]
+fn frequency_to_x_t(frequency_hz: f32) -> f32 {
+    ln_frequency_to_x_t(frequency_hz.ln())
+}
+
+#[inline]
+fn ln_frequency_to_x_t(ln_frequency: f32) -> f32 {
+    (ln_frequency - LN_FREQ_RANGE_START_HZ) / LN_FREQ_RANGE
+}
+
+fn draw_frequency_guide_lines(cx: &mut DrawContext, canvas: &mut Canvas) {
+    let bounds = cx.bounds();
+    let scale_factor = cx.scale_factor();
+    let line_width = scale_factor;
+    let line_paint =
+        vg::Paint::color(theme::ANALYZER_FREQUENCY_GUIDE_LINE).with_line_width(line_width);
+
+    canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
+    for (frequency_hz, _) in FREQUENCY_GUIDES {
+        let x_t = frequency_to_x_t(frequency_hz);
+        if !(0.0..=1.0).contains(&x_t) {
+            continue;
+        }
+
+        let x = bounds.x + (bounds.w * x_t);
+
+        let mut path = vg::Path::new();
+        path.move_to(x, bounds.y);
+        path.line_to(x, bounds.y + bounds.h);
+        canvas.stroke_path(&path, &line_paint);
+    }
+    canvas.reset_scissor();
+}
+
+fn draw_frequency_guide_labels(
+    cx: &mut DrawContext,
+    canvas: &mut Canvas,
+    font_id: Option<vg::FontId>,
+) {
+    let bounds = cx.bounds();
+    let scale_factor = cx.scale_factor();
+    let label_padding = scale_factor * 5.0;
+    let label_y = bounds.y + label_padding;
+    let label_paint = vg::Paint::color(theme::ANALYZER_FREQUENCY_GUIDE_LABEL)
+        .with_font_size(scale_factor * 11.0)
+        .with_text_baseline(vg::Baseline::Top);
+    let label_paint = if let Some(font_id) = font_id {
+        label_paint.with_font(&[font_id])
+    } else {
+        label_paint
+    };
+
+    canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
+    for (frequency_hz, label) in FREQUENCY_GUIDES {
+        let x_t = frequency_to_x_t(frequency_hz);
+        if !(0.0..=1.0).contains(&x_t) {
+            continue;
+        }
+
+        let line_x = bounds.x + (bounds.w * x_t);
+        let min_label_x = bounds.x + label_padding;
+        let max_label_x = bounds.x + bounds.w - label_padding;
+        let label_x = if min_label_x <= max_label_x {
+            (line_x + label_padding).clamp(min_label_x, max_label_x)
+        } else {
+            bounds.x + (bounds.w * 0.5)
+        };
+        let label_paint = label_paint.clone().with_text_align(vg::Align::Left);
+
+        let _ = canvas.fill_text(label_x, label_y, label, &label_paint);
+    }
+    canvas.reset_scissor();
+}
+
+fn point_screen_position(
+    bounds: BoundingBox,
+    curve: &Curve,
+    point: &CurvePoint,
+    display_offset_db: f32,
+) -> Option<(f32, f32)> {
+    if !point.enabled || !point.frequency.is_finite() {
+        return None;
+    }
+
+    let ln_freq = point
+        .frequency
+        .clamp(
+            THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
+            THRESHOLD_CURVE_MAX_FREQUENCY_HZ,
+        )
+        .ln();
+    let x_t = ln_frequency_to_x_t(ln_freq);
+    if !(0.0..=1.0).contains(&x_t) {
+        return None;
+    }
+
+    let y_db = curve.evaluate_ln(ln_freq) + display_offset_db;
+    let y_t = db_to_unclamped_t(y_db);
+
+    Some((
+        bounds.x + (bounds.w * x_t),
+        bounds.y + (bounds.h * (1.0 - y_t)),
+    ))
 }
 
 /// Draw the spectrum analyzer part of the analyzer. These are drawn as vertical bars until the
@@ -293,6 +660,35 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
     let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
     draw_with_offset(upwards_offset_db, upwards_paint);
     draw_with_offset(downwards_offset_db, downwards_paint);
+    draw_curve_points(cx, canvas, analyzer_data, &curve);
+}
+
+fn draw_curve_points(
+    cx: &mut DrawContext,
+    canvas: &mut Canvas,
+    analyzer_data: &AnalyzerData,
+    curve: &Curve,
+) {
+    let bounds = cx.bounds();
+    let radius = cx.scale_factor() * 4.5;
+    let stroke_width = cx.scale_factor() * 1.5;
+    let display_offset_db = editable_curve_display_offset_db(analyzer_data);
+    let fill_paint = vg::Paint::color(theme::ANALYZER_THRESHOLD_POINT_FILL);
+    let stroke_paint =
+        vg::Paint::color(theme::ANALYZER_THRESHOLD_POINT_STROKE).with_line_width(stroke_width);
+
+    canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
+    for point in &analyzer_data.curve_params.points {
+        let Some((x, y)) = point_screen_position(bounds, curve, point, display_offset_db) else {
+            continue;
+        };
+
+        let mut path = vg::Path::new();
+        path.circle(x, y, radius);
+        canvas.fill_path(&path, &fill_paint);
+        canvas.stroke_path(&path, &stroke_paint);
+    }
+    canvas.reset_scissor();
 }
 
 /// Overlays the gain reduction display over the spectrum analyzer.

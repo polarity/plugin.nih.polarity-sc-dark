@@ -9,7 +9,7 @@
 
 .main-column {
   width: 680px;
-  row-between: 2px;
+  row-between: 28px;
   child-left: 1s;
   child-right: 1s;
   background-color: #232323;
@@ -30,7 +30,7 @@
 
 .header-button-group {
   size: auto;
-  col-between: 4px;
+  col-between: 5px;
   top: 2px;
   left: 2px;
 }
@@ -95,6 +95,15 @@
 
 .export-button {
   width: 180px;
+}
+
+.freeze-button-group {
+  width: 180px;
+  col-between: 4px;
+}
+
+.freeze-button {
+  width: 88px;
 }
 
 .export-group {

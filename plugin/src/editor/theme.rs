@@ -25,6 +25,8 @@ pub const ANALYZER_BACKGROUND: vg::Color = vg::Color::rgbaf(0.137, 0.137, 0.137,
 pub const ANALYZER_SPECTRUM_BARS: vg::Color = vg::Color::rgbaf(0.75, 0.75, 0.75, 0.85);
 pub const ANALYZER_SPECTRUM_MESH_LIGHT: vg::Color = vg::Color::rgbaf(0.82, 0.82, 0.82, 0.90);
 pub const ANALYZER_SPECTRUM_MESH_DARK: vg::Color = vg::Color::rgbaf(0.75, 0.75, 0.75, 0.85);
+pub const ANALYZER_FREQUENCY_GUIDE_LINE: vg::Color = vg::Color::rgbaf(0.96, 0.96, 0.96, 0.16);
+pub const ANALYZER_FREQUENCY_GUIDE_LABEL: vg::Color = vg::Color::rgbaf(0.96, 0.96, 0.96, 0.55);
 
 // Gain reduction overlays: yellow for downwards, blue for upwards.
 pub const ANALYZER_GR_DOWNWARDS: vg::Color = vg::Color::rgbaf(0.902, 0.698, 0.227, 0.65);
@@ -33,3 +35,5 @@ pub const ANALYZER_GR_UPWARDS: vg::Color = vg::Color::rgbaf(0.416, 0.784, 0.847,
 // Threshold curves matching the overlay colors above.
 pub const ANALYZER_THRESHOLD_DOWNWARDS: vg::Color = vg::Color::rgbaf(0.902, 0.698, 0.227, 0.9);
 pub const ANALYZER_THRESHOLD_UPWARDS: vg::Color = vg::Color::rgbaf(0.416, 0.784, 0.847, 0.9);
+pub const ANALYZER_THRESHOLD_POINT_FILL: vg::Color = vg::Color::rgbaf(0.137, 0.137, 0.137, 1.0);
+pub const ANALYZER_THRESHOLD_POINT_STROKE: vg::Color = vg::Color::rgbaf(0.96, 0.96, 0.96, 0.95);

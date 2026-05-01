@@ -20,7 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::analyzer::AnalyzerData;
-use crate::curve::{Curve, CurveParams};
+use crate::curve::{
+    Curve, CurveParams, CurvePoint, MAX_THRESHOLD_CURVE_POINTS, THRESHOLD_CURVE_MAX_FREQUENCY_HZ,
+    THRESHOLD_CURVE_MIN_FREQUENCY_HZ, THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
+};
 use crate::frozen_ir::FrozenIrData;
 use crate::SpectralCompressorParams;
 
@@ -28,6 +31,7 @@ use crate::SpectralCompressorParams;
 // The ID prefixes a re set in the `CompressorBankParams` struct.
 const DOWNWARDS_NAME_PREFIX: &str = "Downwards";
 const UPWARDS_NAME_PREFIX: &str = "Upwards";
+const GAIN_SMOOTHING_MAX_RADIUS_LN: f32 = std::f32::consts::LN_2;
 
 /// The envelopes are initialized to the RMS value of a -24 dB sine wave to make sure extreme upwards
 /// compression doesn't cause pops when switching between window sizes and when deactivating and
@@ -102,6 +106,12 @@ pub struct CompressorBank {
     sidechain_spectrum_magnitudes: Vec<Vec<f32>>,
     /// Per-bin channel-linked sidechain magnitudes for the current block.
     linked_sidechain_magnitudes: Vec<f32>,
+    /// Scratch buffer for per-bin gain differences before spectral smoothing.
+    raw_gain_difference_db: Vec<f32>,
+    /// Scratch buffer for the per-bin gain differences that will be applied.
+    smoothed_gain_difference_db: Vec<f32>,
+    /// Prefix sums for smoothing the gain curve without per-bin inner summing.
+    gain_smoothing_prefix_db: Vec<f32>,
     /// The frozen per-bin gain difference snapshot for each channel. When freeze is enabled these
     /// values are captured once and then reused until freeze is disabled or invalidated.
     frozen_gain_difference_db: Vec<Vec<f32>>,
@@ -150,6 +160,10 @@ pub struct ThresholdParams {
     /// frequency. See the polynomial above.
     #[id = "thresh_curve_curve"]
     pub curve_curve: FloatParam,
+    /// Hidden point slots edited from the analyzer graph. These are regular parameters so plugin
+    /// state is saved and restored by hosts without requiring custom serialization.
+    #[nested(array)]
+    pub curve_points: [ThresholdCurvePointParams; MAX_THRESHOLD_CURVE_POINTS],
 
     /// Controls the type of threshold that should be used. Check [`ThresholdMode`] for more
     /// information.
@@ -160,6 +174,19 @@ pub struct ThresholdParams {
     /// to the the compression parameters when using the sidechain modes.
     #[id = "thresh_sc_link"]
     pub sc_channel_link: FloatParam,
+    /// Smooths the final per-bin gain reduction curve before applying it to the FFT bins.
+    #[id = "gain_smoothing"]
+    pub gain_smoothing: FloatParam,
+}
+
+#[derive(Params)]
+pub struct ThresholdCurvePointParams {
+    #[id = "curve_point_enabled"]
+    pub enabled: BoolParam,
+    #[id = "curve_point_frequency"]
+    pub frequency: FloatParam,
+    #[id = "curve_point_offset"]
+    pub offset_db: FloatParam,
 }
 
 /// The type of threshold to use.
@@ -185,6 +212,57 @@ pub enum ThresholdMode {
     #[id = "sidechain_compress"]
     #[name = "Sidechain Compression"]
     SidechainCompress,
+}
+
+impl ThresholdCurvePointParams {
+    fn new(index: usize, set_update_thresholds: Arc<dyn Fn(f32) + Send + Sync>) -> Self {
+        let set_update_enabled = {
+            let set_update_thresholds = set_update_thresholds.clone();
+            Arc::new(move |_| set_update_thresholds(0.0))
+        };
+
+        Self {
+            enabled: BoolParam::new(format!("Curve Point {} Enabled", index + 1), false)
+                .with_callback(set_update_enabled)
+                .hide()
+                .hide_in_generic_ui(),
+            frequency: FloatParam::new(
+                format!("Curve Point {} Frequency", index + 1),
+                1_000.0,
+                FloatRange::Skewed {
+                    min: THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
+                    max: THRESHOLD_CURVE_MAX_FREQUENCY_HZ,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_callback(set_update_thresholds.clone())
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz())
+            .hide()
+            .hide_in_generic_ui(),
+            offset_db: FloatParam::new(
+                format!("Curve Point {} Offset", index + 1),
+                0.0,
+                FloatRange::Linear {
+                    min: -THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
+                    max: THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
+                },
+            )
+            .with_callback(set_update_thresholds)
+            .with_unit(" dB")
+            .with_step_size(0.1)
+            .hide()
+            .hide_in_generic_ui(),
+        }
+    }
+
+    pub fn curve_point(&self) -> CurvePoint {
+        CurvePoint {
+            enabled: self.enabled.value(),
+            frequency: self.frequency.value(),
+            offset_db: self.offset_db.value(),
+        }
+    }
 }
 
 /// Contains the compressor parameters for both the upwards and downwards compressor banks.
@@ -291,7 +369,11 @@ impl ThresholdParams {
             )
             .with_callback(set_update_both_thresholds.clone())
             .with_unit(" dB/oct²")
-            .with_step_size(0.01),
+            .with_step_size(0.01)
+            .hide_in_generic_ui(),
+            curve_points: std::array::from_fn(|index| {
+                ThresholdCurvePointParams::new(index, set_update_both_thresholds.clone())
+            }),
 
             mode: EnumParam::new("Mode", ThresholdMode::Internal)
                 // Not the most efficient way to do this, but it's a bit cleaner than the
@@ -300,6 +382,14 @@ impl ThresholdParams {
             sc_channel_link: FloatParam::new(
                 "SC Channel Link",
                 0.8,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_unit("%")
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+            gain_smoothing: FloatParam::new(
+                "Smoothing",
+                0.0,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
             .with_unit("%")
@@ -323,6 +413,7 @@ impl ThresholdParams {
                 }
             },
             curve: self.curve_curve.value(),
+            points: std::array::from_fn(|index| self.curve_points[index].curve_point()),
         }
     }
 }
@@ -473,6 +564,9 @@ impl CompressorBank {
                 num_channels
             ],
             linked_sidechain_magnitudes: Vec::with_capacity(complex_buffer_len),
+            raw_gain_difference_db: Vec::with_capacity(complex_buffer_len),
+            smoothed_gain_difference_db: Vec::with_capacity(complex_buffer_len),
+            gain_smoothing_prefix_db: Vec::with_capacity(complex_buffer_len + 1),
             frozen_gain_difference_db: vec![Vec::with_capacity(complex_buffer_len); num_channels],
             frozen_gain_snapshot_valid: vec![false; num_channels],
             freeze_was_active: false,
@@ -529,8 +623,17 @@ impl CompressorBank {
         for magnitudes in self.sidechain_spectrum_magnitudes.iter_mut() {
             magnitudes.reserve_exact(complex_buffer_len.saturating_sub(magnitudes.len()));
         }
-        self.linked_sidechain_magnitudes
-            .reserve_exact(complex_buffer_len.saturating_sub(self.linked_sidechain_magnitudes.len()));
+        self.linked_sidechain_magnitudes.reserve_exact(
+            complex_buffer_len.saturating_sub(self.linked_sidechain_magnitudes.len()),
+        );
+        self.raw_gain_difference_db
+            .reserve_exact(complex_buffer_len.saturating_sub(self.raw_gain_difference_db.len()));
+        self.smoothed_gain_difference_db.reserve_exact(
+            complex_buffer_len.saturating_sub(self.smoothed_gain_difference_db.len()),
+        );
+        self.gain_smoothing_prefix_db.reserve_exact(
+            (complex_buffer_len + 1).saturating_sub(self.gain_smoothing_prefix_db.len()),
+        );
 
         self.frozen_gain_difference_db
             .resize_with(num_channels, Vec::new);
@@ -577,7 +680,13 @@ impl CompressorBank {
         for magnitudes in self.sidechain_spectrum_magnitudes.iter_mut() {
             magnitudes.resize(complex_buffer_len, 0.0);
         }
-        self.linked_sidechain_magnitudes.resize(complex_buffer_len, 0.0);
+        self.linked_sidechain_magnitudes
+            .resize(complex_buffer_len, 0.0);
+        self.raw_gain_difference_db.resize(complex_buffer_len, 0.0);
+        self.smoothed_gain_difference_db
+            .resize(complex_buffer_len, 0.0);
+        self.gain_smoothing_prefix_db
+            .resize(complex_buffer_len + 1, 0.0);
 
         for gains in self.frozen_gain_difference_db.iter_mut() {
             gains.resize(complex_buffer_len, 0.0);
@@ -972,14 +1081,9 @@ impl CompressorBank {
         freeze_enabled: bool,
         should_update_analyzer_data: bool,
     ) {
-        // The gain reduction values are always added to the arrays stored in this object. This
-        // makes it possible to visualize the gain reduction without a lot of conditionals.
-        let analyzer_input_data = self.analyzer_input_data.input_buffer();
-
         let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
         let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
 
-        assert!(analyzer_input_data.gain_difference_db.len() >= buffer.len());
         assert!(self.downwards_thresholds_db.len() == buffer.len());
         assert!(self.downwards_ratios.len() == buffer.len());
         assert!(self.downwards_knee_parabola_scale.len() == buffer.len());
@@ -989,16 +1093,11 @@ impl CompressorBank {
         assert!(self.upwards_knee_parabola_scale.len() == buffer.len());
         assert!(self.upwards_knee_parabola_intercept.len() == buffer.len());
         assert!(self.frozen_gain_difference_db[channel_idx].len() == buffer.len());
-        let should_capture_snapshot =
-            freeze_enabled && !self.frozen_gain_snapshot_valid[channel_idx];
-        let frozen_gain_difference_db = &mut self.frozen_gain_difference_db[channel_idx];
+        assert!(self.raw_gain_difference_db.len() == buffer.len());
+        assert!(self.smoothed_gain_difference_db.len() == buffer.len());
         // NOTE: In the sidechain compression mode these envelopes are computed from the sidechain
         //       signal instead of the main input
-        for (bin_idx, (bin, envelope)) in buffer
-            .iter_mut()
-            .zip(self.envelopes[channel_idx].iter())
-            .enumerate()
-        {
+        for (bin_idx, envelope) in self.envelopes[channel_idx].iter().enumerate() {
             // We'll apply the transfer curve to the envelope signal, and then scale the complex
             // `bin` by the gain difference
             let envelope_db = util::gain_to_db_fast_epsilon(*envelope);
@@ -1006,7 +1105,8 @@ impl CompressorBank {
             let downwards_threshold_db = &self.downwards_thresholds_db[bin_idx];
             let downwards_ratio = &self.downwards_ratios[bin_idx];
             let downwards_knee_parabola_scale = &self.downwards_knee_parabola_scale[bin_idx];
-            let downwards_knee_parabola_intercept = &self.downwards_knee_parabola_intercept[bin_idx];
+            let downwards_knee_parabola_intercept =
+                &self.downwards_knee_parabola_intercept[bin_idx];
             let downwards_compressed = compress_downwards(
                 envelope_db,
                 *downwards_threshold_db,
@@ -1040,27 +1140,21 @@ impl CompressorBank {
 
             // If the compressed output is -10 dBFS and the envelope follower was at -6 dBFS, then we
             // want to apply -4 dB of gain to the bin
-            let gain_difference_db =
+            self.raw_gain_difference_db[bin_idx] =
                 downwards_compressed + upwards_compressed - (envelope_db * 2.0);
-            let applied_gain_difference_db = if freeze_enabled {
-                if should_capture_snapshot {
-                    frozen_gain_difference_db[bin_idx] = gain_difference_db;
-                }
-
-                frozen_gain_difference_db[bin_idx]
-            } else {
-                gain_difference_db
-            };
-            if should_update_analyzer_data {
-                analyzer_input_data.gain_difference_db[bin_idx] += applied_gain_difference_db;
-            }
-
-            *bin *= util::db_to_gain_fast(applied_gain_difference_db);
         }
 
-        if should_capture_snapshot {
-            self.frozen_gain_snapshot_valid[channel_idx] = true;
-        }
+        self.smooth_gain_differences(
+            params.threshold.gain_smoothing.value(),
+            first_non_dc_bin,
+            buffer.len(),
+        );
+        self.apply_gain_differences(
+            buffer,
+            channel_idx,
+            freeze_enabled,
+            should_update_analyzer_data,
+        );
     }
 
     /// The same as [`compress()`][Self::compress()], but multiplying the threshold and knee values
@@ -1079,9 +1173,6 @@ impl CompressorBank {
         freeze_enabled: bool,
         should_update_analyzer_data: bool,
     ) {
-        // See `compress()`
-        let analyzer_input_data = self.analyzer_input_data.input_buffer();
-
         let downwards_knee_width_db = params.compressors.downwards.knee_width_db.value();
         let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
 
@@ -1090,7 +1181,6 @@ impl CompressorBank {
         let other_channels_t = params.threshold.sc_channel_link.value() / num_channels;
         let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
 
-        assert!(analyzer_input_data.gain_difference_db.len() >= buffer.len());
         assert!(self.sidechain_spectrum_magnitudes[channel_idx].len() == buffer.len());
         assert!(self.downwards_thresholds_db.len() == buffer.len());
         assert!(self.downwards_ratios.len() == buffer.len());
@@ -1098,12 +1188,10 @@ impl CompressorBank {
         assert!(self.upwards_ratios.len() == buffer.len());
         assert!(self.frozen_gain_difference_db[channel_idx].len() == buffer.len());
         assert!(self.linked_sidechain_magnitudes.len() == buffer.len());
+        assert!(self.raw_gain_difference_db.len() == buffer.len());
+        assert!(self.smoothed_gain_difference_db.len() == buffer.len());
 
-        for (bin_idx, linked_magnitude) in self
-            .linked_sidechain_magnitudes
-            .iter_mut()
-            .enumerate()
-        {
+        for (bin_idx, linked_magnitude) in self.linked_sidechain_magnitudes.iter_mut().enumerate() {
             *linked_magnitude = self
                 .sidechain_spectrum_magnitudes
                 .iter()
@@ -1122,14 +1210,7 @@ impl CompressorBank {
                 .max(f32::EPSILON);
         }
 
-        let should_capture_snapshot =
-            freeze_enabled && !self.frozen_gain_snapshot_valid[channel_idx];
-        let frozen_gain_difference_db = &mut self.frozen_gain_difference_db[channel_idx];
-        for (bin_idx, (bin, envelope)) in buffer
-            .iter_mut()
-            .zip(self.envelopes[channel_idx].iter())
-            .enumerate()
-        {
+        for (bin_idx, envelope) in self.envelopes[channel_idx].iter().enumerate() {
             let envelope_db = util::gain_to_db_fast_epsilon(*envelope);
 
             // The idea here is that we scale the compressor thresholds/knee values by the sidechain
@@ -1138,8 +1219,9 @@ impl CompressorBank {
             let sidechain_scale_db = util::gain_to_db_fast_epsilon(sidechain_scale);
 
             // Notice how the threshold and knee values are scaled here
-            let downwards_threshold_db =
-                (self.downwards_thresholds_db[bin_idx] + sidechain_scale_db).max(util::MINUS_INFINITY_DB);
+            let downwards_threshold_db = (self.downwards_thresholds_db[bin_idx]
+                + sidechain_scale_db)
+                .max(util::MINUS_INFINITY_DB);
             let downwards_ratio = &self.downwards_ratios[bin_idx];
             // Because the thresholds are scaled based on the sidechain input, we also need to
             // recompute the knee coefficients
@@ -1158,8 +1240,8 @@ impl CompressorBank {
                 downwards_knee_parabola_intercept,
             );
 
-            let upwards_threshold_db =
-                (self.upwards_thresholds_db[bin_idx] + sidechain_scale_db).max(util::MINUS_INFINITY_DB);
+            let upwards_threshold_db = (self.upwards_thresholds_db[bin_idx] + sidechain_scale_db)
+                .max(util::MINUS_INFINITY_DB);
             let upwards_ratio = &self.upwards_ratios[bin_idx];
             let upwards_compressed = if bin_idx >= first_non_dc_bin
                 && *upwards_ratio != 1.0
@@ -1185,22 +1267,118 @@ impl CompressorBank {
 
             // If the comprssed output is -10 dBFS and the envelope follower was at -6 dBFS, then we
             // want to apply -4 dB of gain to the bin
-            let gain_difference_db =
+            self.raw_gain_difference_db[bin_idx] =
                 downwards_compressed + upwards_compressed - (envelope_db * 2.0);
-            let applied_gain_difference_db = if freeze_enabled {
-                if should_capture_snapshot {
-                    frozen_gain_difference_db[bin_idx] = gain_difference_db;
-                }
+        }
 
-                frozen_gain_difference_db[bin_idx]
-            } else {
-                gain_difference_db
-            };
-            if should_update_analyzer_data {
-                analyzer_input_data.gain_difference_db[bin_idx] += applied_gain_difference_db;
+        self.smooth_gain_differences(
+            params.threshold.gain_smoothing.value(),
+            first_non_dc_bin,
+            buffer.len(),
+        );
+        self.apply_gain_differences(
+            buffer,
+            channel_idx,
+            freeze_enabled,
+            should_update_analyzer_data,
+        );
+    }
+
+    fn smooth_gain_differences(
+        &mut self,
+        smoothing_amount: f32,
+        first_non_dc_bin: usize,
+        num_bins: usize,
+    ) {
+        assert!(self.raw_gain_difference_db.len() >= num_bins);
+        assert!(self.smoothed_gain_difference_db.len() >= num_bins);
+        assert!(self.gain_smoothing_prefix_db.len() > num_bins);
+        assert!(self.ln_freqs.len() >= num_bins);
+
+        let smoothing_amount = smoothing_amount.clamp(0.0, 1.0);
+        if smoothing_amount <= f32::EPSILON || num_bins <= 2 {
+            self.smoothed_gain_difference_db[..num_bins]
+                .copy_from_slice(&self.raw_gain_difference_db[..num_bins]);
+            return;
+        }
+
+        self.gain_smoothing_prefix_db[0] = 0.0;
+        for bin_idx in 0..num_bins {
+            self.gain_smoothing_prefix_db[bin_idx + 1] =
+                self.gain_smoothing_prefix_db[bin_idx] + self.raw_gain_difference_db[bin_idx];
+        }
+
+        self.smoothed_gain_difference_db[0] = self.raw_gain_difference_db[0];
+
+        let radius_ln = smoothing_amount * GAIN_SMOOTHING_MAX_RADIUS_LN;
+        let mut left_idx = 1;
+        let mut right_idx = 1;
+        for bin_idx in 1..num_bins {
+            let center_ln = self.ln_freqs[bin_idx];
+
+            while left_idx < bin_idx && center_ln - self.ln_freqs[left_idx] > radius_ln {
+                left_idx += 1;
             }
 
-            *bin *= util::db_to_gain_fast(applied_gain_difference_db);
+            right_idx = right_idx.max(bin_idx);
+            while right_idx + 1 < num_bins && self.ln_freqs[right_idx + 1] - center_ln <= radius_ln
+            {
+                right_idx += 1;
+            }
+
+            let sum = self.gain_smoothing_prefix_db[right_idx + 1]
+                - self.gain_smoothing_prefix_db[left_idx];
+            let count = (right_idx - left_idx + 1) as f32;
+            let averaged = sum / count;
+            let raw = self.raw_gain_difference_db[bin_idx];
+            let mut smoothed = raw + ((averaged - raw) * smoothing_amount);
+
+            if bin_idx < first_non_dc_bin && smoothed > 0.0 {
+                smoothed = 0.0;
+            }
+
+            self.smoothed_gain_difference_db[bin_idx] = smoothed;
+        }
+    }
+
+    fn apply_gain_differences(
+        &mut self,
+        buffer: &mut [Complex32],
+        channel_idx: usize,
+        freeze_enabled: bool,
+        should_update_analyzer_data: bool,
+    ) {
+        assert!(self.frozen_gain_difference_db[channel_idx].len() == buffer.len());
+        assert!(self.smoothed_gain_difference_db.len() >= buffer.len());
+
+        let should_capture_snapshot =
+            freeze_enabled && !self.frozen_gain_snapshot_valid[channel_idx];
+
+        {
+            // The gain reduction values are always added to the arrays stored in this object. This
+            // makes it possible to visualize the gain reduction without a lot of conditionals.
+            let analyzer_input_data = self.analyzer_input_data.input_buffer();
+            assert!(analyzer_input_data.gain_difference_db.len() >= buffer.len());
+            let frozen_gain_difference_db = &mut self.frozen_gain_difference_db[channel_idx];
+            let smoothed_gain_difference_db = &self.smoothed_gain_difference_db[..buffer.len()];
+
+            for (bin_idx, bin) in buffer.iter_mut().enumerate() {
+                let smoothed_gain_difference_db = smoothed_gain_difference_db[bin_idx];
+                let applied_gain_difference_db = if freeze_enabled {
+                    if should_capture_snapshot {
+                        frozen_gain_difference_db[bin_idx] = smoothed_gain_difference_db;
+                    }
+
+                    frozen_gain_difference_db[bin_idx]
+                } else {
+                    smoothed_gain_difference_db
+                };
+                if should_update_analyzer_data {
+                    analyzer_input_data.gain_difference_db[bin_idx] += applied_gain_difference_db;
+                }
+
+                *bin *= util::db_to_gain_fast(applied_gain_difference_db);
+            }
         }
 
         if should_capture_snapshot {
@@ -1527,6 +1705,16 @@ mod tests {
         );
     }
 
+    fn assert_slice_near(lhs: &[f32], rhs: &[f32]) {
+        assert_eq!(lhs.len(), rhs.len());
+        for (idx, (left, right)) in lhs.iter().zip(rhs).enumerate() {
+            assert!(
+                (*left - *right).abs() < 1.0e-5,
+                "mismatch at {idx}: {left} != {right}"
+            );
+        }
+    }
+
     fn run_with_large_stack(test_fn: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
@@ -1534,6 +1722,100 @@ mod tests {
             .expect("failed to spawn test thread")
             .join()
             .expect("test thread panicked");
+    }
+
+    #[test]
+    fn gain_smoothing_zero_percent_is_unchanged() {
+        let window_size = 32;
+        let num_bins = window_size / 2 + 1;
+        let (mut compressor_bank, _params, _frozen_ir_output_data) =
+            make_bank_and_params(1, window_size);
+        let raw: Vec<f32> = (0..num_bins)
+            .map(|bin_idx| (bin_idx as f32 % 5.0) - 8.0)
+            .collect();
+        compressor_bank.raw_gain_difference_db[..num_bins].copy_from_slice(&raw);
+
+        compressor_bank.smooth_gain_differences(0.0, 1, num_bins);
+
+        assert_slice_near(
+            &compressor_bank.smoothed_gain_difference_db[..num_bins],
+            &raw,
+        );
+    }
+
+    #[test]
+    fn gain_smoothing_reduces_isolated_bin_spikes() {
+        let window_size = 64;
+        let num_bins = window_size / 2 + 1;
+        let (mut compressor_bank, _params, _frozen_ir_output_data) =
+            make_bank_and_params(1, window_size);
+        compressor_bank.raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.raw_gain_difference_db[16] = -24.0;
+
+        compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
+
+        assert!(compressor_bank.smoothed_gain_difference_db[16] > -24.0);
+        assert!(compressor_bank.smoothed_gain_difference_db[16] < 0.0);
+        assert!(compressor_bank.smoothed_gain_difference_db[15] < 0.0);
+        assert!(compressor_bank.smoothed_gain_difference_db[17] < 0.0);
+    }
+
+    #[test]
+    fn gain_smoothing_preserves_constant_curves() {
+        let window_size = 64;
+        let num_bins = window_size / 2 + 1;
+        let (mut compressor_bank, _params, _frozen_ir_output_data) =
+            make_bank_and_params(1, window_size);
+        compressor_bank.raw_gain_difference_db[..num_bins].fill(-6.0);
+
+        compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
+
+        for gain_db in &compressor_bank.smoothed_gain_difference_db[..num_bins] {
+            assert!((*gain_db + 6.0).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn gain_smoothing_does_not_add_low_frequency_upwards_gain() {
+        let window_size = 64;
+        let num_bins = window_size / 2 + 1;
+        let (mut compressor_bank, _params, _frozen_ir_output_data) =
+            make_bank_and_params(1, window_size);
+        compressor_bank.raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.raw_gain_difference_db[3] = 18.0;
+        compressor_bank.raw_gain_difference_db[4] = 18.0;
+
+        compressor_bank.smooth_gain_differences(1.0, 4, num_bins);
+
+        assert!(compressor_bank.smoothed_gain_difference_db[1] <= 0.0);
+        assert!(compressor_bank.smoothed_gain_difference_db[2] <= 0.0);
+        assert!(compressor_bank.smoothed_gain_difference_db[3] <= 0.0);
+        assert!(compressor_bank.smoothed_gain_difference_db[4] > 0.0);
+    }
+
+    #[test]
+    fn freeze_captures_smoothed_gain_curve() {
+        let window_size = 64;
+        let num_bins = window_size / 2 + 1;
+        let (mut compressor_bank, _params, _frozen_ir_output_data) =
+            make_bank_and_params(1, window_size);
+        compressor_bank.raw_gain_difference_db[..num_bins].fill(0.0);
+        compressor_bank.raw_gain_difference_db[16] = -24.0;
+        compressor_bank.smooth_gain_differences(1.0, 1, num_bins);
+        let smoothed_snapshot = compressor_bank.smoothed_gain_difference_db[..num_bins].to_vec();
+        let mut buffer = make_complex_buffer(1.0, num_bins);
+
+        compressor_bank.apply_gain_differences(&mut buffer, 0, true, true);
+
+        assert!(compressor_bank.frozen_gain_snapshot_valid[0]);
+        assert_slice_near(
+            &compressor_bank.frozen_gain_difference_db[0][..num_bins],
+            &smoothed_snapshot,
+        );
+        assert_ne!(
+            compressor_bank.frozen_gain_difference_db[0][16],
+            compressor_bank.raw_gain_difference_db[16]
+        );
     }
 
     #[test]
@@ -1718,4 +2000,3 @@ mod tests {
         });
     }
 }
-
