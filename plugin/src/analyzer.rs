@@ -42,11 +42,18 @@ pub struct AnalyzerData {
     ///
     /// This data is taken directly from the envelope followers, so it has the same rise and fall
     /// time as what is used by the compressors.
-    pub envelope_followers: [f32; crate::MAX_WINDOW_SIZE / 2 + 1],
+    ///
+    /// Always sized to `MAX_WINDOW_SIZE / 2 + 1`. Heap-allocated to keep `Default::default()` from
+    /// blowing the stack (DAWs typically only give us a 1 MB UI thread stack and this struct is
+    /// triple-buffered).
+    pub envelope_followers: Vec<f32>,
     /// The gain different applied to each band, in decibels. Alternatively, the negative gain
     /// reduction. Positive values mean that a band becomes louder, and negative values mean a band
     /// got attenuated. Does not (and should not) factor in the output gain.
-    pub gain_difference_db: [f32; crate::MAX_WINDOW_SIZE / 2 + 1],
+    ///
+    /// Always sized to `MAX_WINDOW_SIZE / 2 + 1`. See `envelope_followers` for why this is heap
+    /// allocated.
+    pub gain_difference_db: Vec<f32>,
 }
 
 impl Default for AnalyzerData {
@@ -55,8 +62,8 @@ impl Default for AnalyzerData {
             curve_params: CurveParams::default(),
             curve_offsets_db: (0.0, 0.0),
             num_bins: 0,
-            envelope_followers: [0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
-            gain_difference_db: [0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
+            envelope_followers: vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
+            gain_difference_db: vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
         }
     }
 }

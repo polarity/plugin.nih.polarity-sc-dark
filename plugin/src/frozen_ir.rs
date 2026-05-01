@@ -23,7 +23,11 @@ pub struct FrozenIrData {
     pub overlap_times: usize,
     pub num_channels: usize,
     /// Per-channel, per-bin gain deltas in dB that produce the captured spectral curve.
-    pub gain_difference_db: [[f32; crate::MAX_WINDOW_SIZE / 2 + 1]; MAX_IR_CHANNELS],
+    ///
+    /// Outer length is always `MAX_IR_CHANNELS`; each inner `Vec` is sized to
+    /// `MAX_WINDOW_SIZE / 2 + 1`. Heap-allocated to keep `Default::default()` from blowing the
+    /// stack (this struct is triple-buffered and constructed during plugin instantiation).
+    pub gain_difference_db: [Vec<f32>; MAX_IR_CHANNELS],
 }
 
 impl Default for FrozenIrData {
@@ -34,7 +38,9 @@ impl Default for FrozenIrData {
             window_size: 0,
             overlap_times: 0,
             num_channels: 0,
-            gain_difference_db: [[0.0; crate::MAX_WINDOW_SIZE / 2 + 1]; MAX_IR_CHANNELS],
+            gain_difference_db: std::array::from_fn(|_| {
+                vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1]
+            }),
         }
     }
 }
