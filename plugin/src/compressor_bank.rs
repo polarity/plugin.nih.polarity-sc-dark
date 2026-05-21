@@ -25,6 +25,7 @@ use crate::curve::{
     THRESHOLD_CURVE_MIN_FREQUENCY_HZ, THRESHOLD_CURVE_POINT_OFFSET_LIMIT_DB,
 };
 use crate::frozen_ir::FrozenIrData;
+use crate::match_curve::{MatchCurveMeter, MatchCurveRuntime};
 use crate::SpectralCompressorParams;
 
 // These are the parameter name prefixes used for the downwards and upwards compression parameters.
@@ -32,6 +33,7 @@ use crate::SpectralCompressorParams;
 const DOWNWARDS_NAME_PREFIX: &str = "Downwards";
 const UPWARDS_NAME_PREFIX: &str = "Upwards";
 const GAIN_SMOOTHING_MAX_RADIUS_LN: f32 = std::f32::consts::LN_2;
+const PINK_NOISE_SLOPE_OFFSET_DB_PER_OCT: f32 = 3.0;
 
 /// The envelopes are initialized to the RMS value of a -24 dB sine wave to make sure extreme upwards
 /// compression doesn't cause pops when switching between window sizes and when deactivating and
@@ -136,6 +138,10 @@ pub struct CompressorBank {
     frozen_ir_input_data: triple_buffer::Input<FrozenIrData>,
     /// Set to `true` when analyzer data has been fully prepared and is ready to publish.
     analyzer_needs_publish: bool,
+    /// Request/result handoff for editor-triggered threshold curve matching.
+    match_curve_runtime: Arc<MatchCurveRuntime>,
+    /// Audio-thread local accumulator for threshold curve matching.
+    match_curve_meter: MatchCurveMeter,
 }
 
 #[derive(Params)]
@@ -331,7 +337,7 @@ impl ThresholdParams {
             .with_step_size(0.1),
             center_frequency: FloatParam::new(
                 "Threshold Center",
-                420.0,
+                1_000.0,
                 FloatRange::Skewed {
                     min: 20.0,
                     max: 20_000.0,
@@ -355,6 +361,22 @@ impl ThresholdParams {
                 },
             )
             .with_callback(set_update_both_thresholds.clone())
+            .with_value_to_string(Arc::new(|value| {
+                let display_value = threshold_slope_to_display_value(value);
+                if (display_value * 100.0).round() / 100.0 == 0.0 {
+                    String::from("0.00")
+                } else {
+                    format!("{display_value:.2}")
+                }
+            }))
+            .with_string_to_value(Arc::new(|string| {
+                string
+                    .trim_end_matches([' ', 'd', 'D', 'b', 'B', '/', 'o', 'O', 'c', 'C', 't', 'T'])
+                    .trim()
+                    .parse()
+                    .ok()
+                    .map(threshold_slope_from_display_value)
+            }))
             .with_unit(" dB/oct")
             .with_step_size(0.01),
             curve_curve: FloatParam::new(
@@ -407,7 +429,7 @@ impl ThresholdParams {
             // default settings. When using sidechaining we explicitly don't want this because
             // the curve should be a flat offset to the sidechain input at the default settings.
             slope: match self.mode.value() {
-                ThresholdMode::Internal => self.curve_slope.value() - 3.0,
+                ThresholdMode::Internal => internal_threshold_slope(self.curve_slope.value()),
                 ThresholdMode::SidechainMatch | ThresholdMode::SidechainCompress => {
                     self.curve_slope.value()
                 }
@@ -416,6 +438,21 @@ impl ThresholdParams {
             points: std::array::from_fn(|index| self.curve_points[index].curve_point()),
         }
     }
+}
+
+#[inline]
+fn internal_threshold_slope(stored_slope: f32) -> f32 {
+    stored_slope - PINK_NOISE_SLOPE_OFFSET_DB_PER_OCT
+}
+
+#[inline]
+fn threshold_slope_to_display_value(stored_slope: f32) -> f32 {
+    PINK_NOISE_SLOPE_OFFSET_DB_PER_OCT - stored_slope
+}
+
+#[inline]
+fn threshold_slope_from_display_value(display_slope: f32) -> f32 {
+    PINK_NOISE_SLOPE_OFFSET_DB_PER_OCT - display_slope
 }
 
 impl CompressorBankParams {
@@ -529,9 +566,10 @@ impl CompressorParams {
 impl CompressorBank {
     /// Set up the compressor for the given channel count and maximum FFT window size. The
     /// compressors won't be initialized yet.
-    pub fn new(
+    pub(crate) fn new(
         analyzer_input_data: triple_buffer::Input<AnalyzerData>,
         frozen_ir_input_data: triple_buffer::Input<FrozenIrData>,
+        match_curve_runtime: Arc<MatchCurveRuntime>,
         num_channels: usize,
         max_window_size: usize,
     ) -> Self {
@@ -577,6 +615,8 @@ impl CompressorBank {
             analyzer_input_data,
             frozen_ir_input_data,
             analyzer_needs_publish: false,
+            match_curve_runtime,
+            match_curve_meter: MatchCurveMeter::new(complex_buffer_len),
         }
     }
 
@@ -634,6 +674,7 @@ impl CompressorBank {
         self.gain_smoothing_prefix_db.reserve_exact(
             (complex_buffer_len + 1).saturating_sub(self.gain_smoothing_prefix_db.len()),
         );
+        self.match_curve_meter.resize(complex_buffer_len);
 
         self.frozen_gain_difference_db
             .resize_with(num_channels, Vec::new);
@@ -687,6 +728,7 @@ impl CompressorBank {
             .resize(complex_buffer_len, 0.0);
         self.gain_smoothing_prefix_db
             .resize(complex_buffer_len + 1, 0.0);
+        self.match_curve_meter.resize(complex_buffer_len);
 
         for gains in self.frozen_gain_difference_db.iter_mut() {
             gains.resize(complex_buffer_len, 0.0);
@@ -811,9 +853,14 @@ impl CompressorBank {
         }
 
         self.update_if_needed(params);
+        if self.match_curve_runtime.begin_running_if_requested() {
+            self.match_curve_meter.start(self.sample_rate);
+        }
+
         match mode {
             ThresholdMode::Internal => {
                 self.update_envelopes(buffer, channel_idx, params, overlap_times);
+                self.measure_match_curve_complex(buffer, channel_idx, params, overlap_times);
                 self.compress(
                     buffer,
                     channel_idx,
@@ -825,6 +872,7 @@ impl CompressorBank {
             }
             ThresholdMode::SidechainMatch => {
                 self.update_envelopes(buffer, channel_idx, params, overlap_times);
+                self.measure_match_curve_complex(buffer, channel_idx, params, overlap_times);
                 self.compress_sidechain_match(
                     buffer,
                     channel_idx,
@@ -839,6 +887,7 @@ impl CompressorBank {
                 // sidechain input magnitudes. These are already set in `process_sidechain`. This
                 // separate envelope updating function is needed for the channel linking.
                 self.update_envelopes_sidechain(channel_idx, params, overlap_times);
+                self.measure_match_curve_sidechain(channel_idx, params, overlap_times);
                 self.compress(
                     buffer,
                     channel_idx,
@@ -1062,6 +1111,84 @@ impl CompressorBank {
             .zip(self.sidechain_spectrum_magnitudes[channel_idx].iter_mut())
         {
             *magnitude = bin.norm();
+        }
+    }
+
+    fn measure_match_curve_complex(
+        &mut self,
+        buffer: &[Complex32],
+        channel_idx: usize,
+        params: &SpectralCompressorParams,
+        overlap_times: usize,
+    ) {
+        if !self.match_curve_meter.is_active() {
+            return;
+        }
+
+        self.match_curve_meter
+            .measure_magnitudes(buffer.iter().map(|bin| bin.norm()));
+        self.finish_match_curve_channel_if_needed(channel_idx, params, overlap_times);
+    }
+
+    fn measure_match_curve_sidechain(
+        &mut self,
+        channel_idx: usize,
+        params: &SpectralCompressorParams,
+        overlap_times: usize,
+    ) {
+        if !self.match_curve_meter.is_active() {
+            return;
+        }
+
+        let num_channels = self.sidechain_spectrum_magnitudes.len() as f32;
+        let other_channels_t = params.threshold.sc_channel_link.value() / num_channels;
+        let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
+
+        self.match_curve_meter
+            .measure_magnitudes((0..self.ln_freqs.len()).map(|bin_idx| {
+                self.sidechain_spectrum_magnitudes
+                    .iter()
+                    .enumerate()
+                    .map(|(sidechain_channel_idx, magnitudes)| {
+                        let t = if sidechain_channel_idx == channel_idx {
+                            this_channel_t
+                        } else {
+                            other_channels_t
+                        };
+
+                        magnitudes[bin_idx] * t
+                    })
+                    .sum::<f32>()
+            }));
+        self.finish_match_curve_channel_if_needed(channel_idx, params, overlap_times);
+    }
+
+    fn finish_match_curve_channel_if_needed(
+        &mut self,
+        channel_idx: usize,
+        params: &SpectralCompressorParams,
+        overlap_times: usize,
+    ) {
+        if channel_idx != self.sidechain_spectrum_magnitudes.len() - 1 {
+            return;
+        }
+
+        let hop_frames = (self.window_size / overlap_times).max(1);
+        let threshold = &params.threshold;
+        let fixed_slope = match threshold.mode.value() {
+            ThresholdMode::Internal => internal_threshold_slope(threshold.curve_slope.value()),
+            ThresholdMode::SidechainMatch | ThresholdMode::SidechainCompress => {
+                threshold.curve_slope.value()
+            }
+        };
+        if let Some(result) = self.match_curve_meter.advance_and_finish(
+            hop_frames,
+            &self.ln_freqs,
+            params.compressors.downwards.threshold_offset_db.value(),
+            threshold.center_frequency.value(),
+            fixed_slope,
+        ) {
+            self.match_curve_runtime.publish_result(result);
         }
     }
 
@@ -1651,9 +1778,11 @@ mod tests {
             TripleBuffer::<AnalyzerData>::default().split();
         let (frozen_ir_input_data, frozen_ir_output_data) =
             TripleBuffer::<FrozenIrData>::default().split();
+        let match_curve_runtime = Arc::new(MatchCurveRuntime::new());
         let mut compressor_bank = CompressorBank::new(
             analyzer_input_data,
             frozen_ir_input_data,
+            match_curve_runtime,
             num_channels,
             window_size,
         );
@@ -1722,6 +1851,21 @@ mod tests {
             .expect("failed to spawn test thread")
             .join()
             .expect("test thread panicked");
+    }
+
+    #[test]
+    fn threshold_slope_default_displays_as_pink_noise_tilt() {
+        assert_eq!(threshold_slope_to_display_value(0.0), 3.0);
+        assert_eq!(threshold_slope_from_display_value(3.0), 0.0);
+        assert_eq!(internal_threshold_slope(0.0), -3.0);
+    }
+
+    #[test]
+    fn threshold_slope_zero_display_maps_to_white_noise_tilt() {
+        let stored_slope = threshold_slope_from_display_value(0.0);
+
+        assert_eq!(stored_slope, 3.0);
+        assert_eq!(internal_threshold_slope(stored_slope), 0.0);
     }
 
     #[test]

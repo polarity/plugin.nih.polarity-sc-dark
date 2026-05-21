@@ -38,6 +38,9 @@ use super::theme;
 const LN_FREQ_RANGE_START_HZ: f32 = 3.4011974; // 30.0f32.ln();
 const LN_FREQ_RANGE_END_HZ: f32 = 9.998797; // 22_000.0f32.ln();
 const LN_FREQ_RANGE: f32 = LN_FREQ_RANGE_END_HZ - LN_FREQ_RANGE_START_HZ;
+const VISUAL_TILT_ANCHOR_HZ: f32 = 1_000.0;
+const LN_VISUAL_TILT_ANCHOR_HZ: f32 = 6.9077554; // 1_000.0f32.ln();
+const VISUAL_TILT_DB_PER_LN_FREQ: f32 = 3.0;
 const FREQUENCY_GUIDES: [(f32, &str); 4] = [
     (30.0, "30 Hz"),
     (100.0, "100 Hz"),
@@ -193,7 +196,7 @@ impl Analyzer {
             THRESHOLD_CURVE_MIN_FREQUENCY_HZ,
             THRESHOLD_CURVE_MAX_FREQUENCY_HZ,
         );
-        let clicked_db = unclamped_t_to_db(y_t);
+        let clicked_db = display_db_to_raw_db(unclamped_t_to_db(y_t), ln_freq);
         let curve_params = self.params.threshold.curve_params();
         let curve = Curve::new(&curve_params);
         let offset_db = (clicked_db
@@ -377,6 +380,22 @@ fn unclamped_t_to_db(t: f32) -> f32 {
     (t * 100.0) - 80.0
 }
 
+#[inline]
+fn visual_tilt_offset_db(ln_frequency: f32) -> f32 {
+    debug_assert!((LN_VISUAL_TILT_ANCHOR_HZ - VISUAL_TILT_ANCHOR_HZ.ln()).abs() < 1.0e-6);
+    VISUAL_TILT_DB_PER_LN_FREQ * (ln_frequency - LN_VISUAL_TILT_ANCHOR_HZ)
+}
+
+#[inline]
+fn raw_db_to_display_db(raw_db: f32, ln_frequency: f32) -> f32 {
+    raw_db + visual_tilt_offset_db(ln_frequency)
+}
+
+#[inline]
+fn display_db_to_raw_db(display_db: f32, ln_frequency: f32) -> f32 {
+    display_db - visual_tilt_offset_db(ln_frequency)
+}
+
 fn editable_curve_display_offset_db(analyzer_data: &AnalyzerData) -> f32 {
     let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
     (upwards_offset_db + downwards_offset_db) * 0.5
@@ -478,7 +497,7 @@ fn point_screen_position(
         return None;
     }
 
-    let y_db = curve.evaluate_ln(ln_freq) + display_offset_db;
+    let y_db = raw_db_to_display_db(curve.evaluate_ln(ln_freq) + display_offset_db, ln_freq);
     let y_t = db_to_unclamped_t(y_db);
 
     Some((
@@ -514,10 +533,10 @@ fn draw_spectrum(
         |bin_idx: f32| (bin_frequency(bin_idx).ln() - LN_FREQ_RANGE_START_HZ) / LN_FREQ_RANGE;
     // Converts a linear magnitude value in to a `[0, 1]` value where 0 is -80 dB or lower, and 1 is
     // +20 dB or higher.
-    let magnitude_height = |magnitude: f32| {
+    let magnitude_height = |magnitude: f32, ln_freq: f32| {
         nih_debug_assert!(magnitude >= 0.0);
         let magnitude_db = nih_plug::util::gain_to_db(magnitude);
-        db_to_unclamped_t(magnitude_db).clamp(0.0, 1.0)
+        db_to_unclamped_t(raw_db_to_display_db(magnitude_db, ln_freq)).clamp(0.0, 1.0)
     };
 
     // The first part of this drawing routing is simple. Individual bins are drawn as bars until the
@@ -551,7 +570,7 @@ fn draw_spectrum(
         // Scale this so that 1.0/0 dBFS magnitude is at 80% of the height, the bars begin
         // at -80 dBFS, and that the scaling is linear. This is the same scaling used in
         // Diopser's spectrum analyzer.
-        let height = magnitude_height(*magnitude);
+        let height = magnitude_height(*magnitude, bin_frequency(bin_idx as f32).ln());
 
         bars_path.move_to(physical_x_coord, bounds.y + (bounds.h * (1.0 - height)));
         bars_path.line_to(physical_x_coord, bounds.y + bounds.h);
@@ -581,7 +600,7 @@ fn draw_spectrum(
 
         let physical_x_coord = bounds.x + (bounds.w * t);
         previous_physical_x_coord = physical_x_coord;
-        let height = magnitude_height(*magnitude);
+        let height = magnitude_height(*magnitude, bin_frequency(bin_idx as f32).ln());
         if height > 0.0 {
             mesh_path.line_to(
                 physical_x_coord,
@@ -636,7 +655,7 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
 
             // Evaluating the curve results in a value in dB, which must then be mapped to the same
             // scale used in `draw_spectrum()`
-            let y_db = curve.evaluate_ln(ln_freq) + offset_db;
+            let y_db = raw_db_to_display_db(curve.evaluate_ln(ln_freq) + offset_db, ln_freq);
             let y_t = db_to_unclamped_t(y_db);
 
             let physical_x_pos = bounds.x + (bounds.w * x_t);
@@ -769,4 +788,40 @@ fn draw_gain_reduction(
     canvas.fill_path(&downwards_path, &downwards_paint);
     canvas.fill_path(&upwards_path, &upwards_paint);
     canvas.global_composite_blend_func(vg::BlendFactor::One, vg::BlendFactor::OneMinusSrcAlpha);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pink_noise_slope_displays_flat_around_one_khz() {
+        let anchor_ln = VISUAL_TILT_ANCHOR_HZ.ln();
+        let low_ln = 100.0f32.ln();
+        let high_ln = 10_000.0f32.ln();
+        let raw_pink_db =
+            |ln_freq: f32| -18.0 - (VISUAL_TILT_DB_PER_LN_FREQ * (ln_freq - anchor_ln));
+
+        let low_display_db = raw_db_to_display_db(raw_pink_db(low_ln), low_ln);
+        let high_display_db = raw_db_to_display_db(raw_pink_db(high_ln), high_ln);
+
+        assert!((low_display_db - high_display_db).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn raw_flat_line_displays_as_rising_tilt() {
+        let low_display_db = raw_db_to_display_db(-18.0, 100.0f32.ln());
+        let high_display_db = raw_db_to_display_db(-18.0, 10_000.0f32.ln());
+
+        assert!(high_display_db > low_display_db);
+    }
+
+    #[test]
+    fn display_to_raw_mapping_inverts_visual_tilt() {
+        let ln_freq = 4_200.0f32.ln();
+        let raw_db = -24.0;
+        let display_db = raw_db_to_display_db(raw_db, ln_freq);
+
+        assert!((display_db_to_raw_db(display_db, ln_freq) - raw_db).abs() < 1.0e-6);
+    }
 }

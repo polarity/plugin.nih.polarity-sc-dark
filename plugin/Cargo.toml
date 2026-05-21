@@ -1,6 +1,6 @@
 [package]
 name = "polarity_sc_dark"
-version = "0.5.2"
+version = "0.5.4"
 edition = "2021"
 authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>", "Robert Polarity Agthe <hey@polarity.productions>"]
 license = "GPL-3.0-or-later"
@@ -27,9 +27,10 @@ atomic_refcell = "0.1"
 crossbeam = "0.8"
 open = "3.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+directories = "5.0"
 triple_buffer = "6.2"
 
 [features]
-# Read theme.css from disk at runtime so you can tweak it without recompiling.
-# Close and reopen the editor window to pick up changes.
+# Read theme.css from disk at runtime and reload it while the editor is open.
 hot-reload = []

@@ -15,8 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use analyzer::AnalyzerData;
-use atomic_refcell::AtomicRefCell;
 use atomic_float::AtomicF32;
+use atomic_refcell::AtomicRefCell;
 use frozen_ir::FrozenIrData;
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
@@ -29,12 +29,15 @@ use triple_buffer::TripleBuffer;
 mod analyzer;
 mod compressor_bank;
 mod curve;
+mod curve_preset;
 mod dry_wet_mixer;
 mod editor;
 mod frozen_ir;
+mod match_curve;
 mod match_level;
 
 use crate::compressor_bank::ThresholdMode;
+use crate::match_curve::MatchCurveRuntime;
 use crate::match_level::{MatchMeter, MatchRuntime, OUTPUT_GAIN_MAX_DB, OUTPUT_GAIN_MIN_DB};
 
 const MIN_WINDOW_ORDER: usize = 6;
@@ -71,6 +74,8 @@ pub struct SpectralCompressor {
 
     /// Shared state for the editor-triggered output gain matching operation.
     match_runtime: Arc<MatchRuntime>,
+    /// Shared state for the editor-triggered threshold curve matching operation.
+    match_curve_runtime: Arc<MatchCurveRuntime>,
     /// Audio-thread local RMS accumulator used while a match operation is running.
     match_meter: MatchMeter,
 
@@ -159,15 +164,15 @@ pub struct GlobalParams {
 impl Default for SpectralCompressor {
     fn default() -> Self {
         let mut planner = RealFftPlanner::new();
-        let plan_for_order: [Plan; MAX_WINDOW_ORDER - MIN_WINDOW_ORDER + 1] =
-            (MIN_WINDOW_ORDER..=MAX_WINDOW_ORDER)
-                .map(|order| Plan {
-                    r2c_plan: planner.plan_fft_forward(1 << order),
-                    c2r_plan: planner.plan_fft_inverse(1 << order),
-                })
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap_or_else(|_| panic!("Mismatched plan orders"));
+        let plan_for_order: [Plan; MAX_WINDOW_ORDER - MIN_WINDOW_ORDER + 1] = (MIN_WINDOW_ORDER
+            ..=MAX_WINDOW_ORDER)
+            .map(|order| Plan {
+                r2c_plan: planner.plan_fft_forward(1 << order),
+                c2r_plan: planner.plan_fft_inverse(1 << order),
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap_or_else(|_| panic!("Mismatched plan orders"));
 
         // The spectrum analyzer and gain reduction data is computed directly in the spectral
         // compression routine in `compressor_bank`. `analyzer_output_data` can then be used in the
@@ -177,9 +182,11 @@ impl Default for SpectralCompressor {
 
         // Changing any of the compressor threshold or ratio parameters will set an atomic flag in
         // this object that causes the compressor thresholds and ratios to be recalcualted
+        let match_curve_runtime = Arc::new(MatchCurveRuntime::new());
         let compressor_bank = compressor_bank::CompressorBank::new(
             analyzer_input_data,
             frozen_ir_input_data,
+            match_curve_runtime.clone(),
             2,
             MAX_WINDOW_SIZE,
         );
@@ -201,6 +208,7 @@ impl Default for SpectralCompressor {
             dry_wet_mixer: dry_wet_mixer::DryWetMixer::new(0, 0, 0),
             compressor_bank,
             match_runtime: Arc::new(MatchRuntime::new()),
+            match_curve_runtime,
             match_meter: MatchMeter::new(),
 
             plan_for_order,
@@ -348,6 +356,7 @@ impl Plugin for SpectralCompressor {
 
                 delta_active: self.delta_active.clone(),
                 match_runtime: self.match_runtime.clone(),
+                match_curve_runtime: self.match_curve_runtime.clone(),
 
                 analyzer_data: self.analyzer_output_data.clone(),
                 frozen_ir_data: self.frozen_ir_output_data.clone(),
@@ -460,7 +469,7 @@ impl Plugin for SpectralCompressor {
                 / ((self.buffer_config.sample_rate / 2.0) / num_bins as f32))
                 .floor() as usize
                 + 1)
-                .min(num_bins);
+            .min(num_bins);
             let stft_main_config = StftMainConfig {
                 fft_plan,
                 window_function: &self.window_function,
@@ -533,11 +542,8 @@ impl Plugin for SpectralCompressor {
             }
 
             if bypass_active && !match_active {
-                self.dry_wet_mixer.mix_in_dry(
-                    buffer,
-                    0.0,
-                    self.stft.latency_samples() as usize,
-                );
+                self.dry_wet_mixer
+                    .mix_in_dry(buffer, 0.0, self.stft.latency_samples() as usize);
             } else {
                 self.dry_wet_mixer.mix_in_dry(
                     buffer,

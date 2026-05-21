@@ -1,3 +1,13 @@
+/* Debug borders for layout development. Uncomment as needed. */
+/*
+.row {
+  border: 1px solid #df0909;
+}
+.label {
+  border: 1px solid #bfdf09;
+}
+*/
+
 /* Main panel. Keep hex values in sync with editor::theme constants. */
 
 :root {
@@ -9,7 +19,7 @@
 
 .main-column {
   width: 680px;
-  row-between: 28px;
+  row-between: 10px;
   child-left: 1s;
   child-right: 1s;
   background-color: #232323;
@@ -20,9 +30,9 @@
 /* Layout: header bar. */
 
 .header-bar {
-  height: 30px;
+  height: 40px;
   right: 17px;
-  bottom: 18px;
+  bottom: 10px;
   left: 10px;
   top: 10px;
   col-between: 1s;
@@ -56,14 +66,14 @@
 .plugin-title {
   font-family: "Noto Sans";
   font-weight: thin;
-  font-size: 30;
+  font-size: 25;
 }
 
 .version-label {
   color: #696969;
-  top: 1s;
-  bottom: 4px;
-  left: 2px;
+  top: 1px;
+  bottom: 0px;
+  left: 5px;
 }
 
 /* Generic column used by make_column(). */
@@ -92,13 +102,13 @@
 }
 
 /* Export button group. */
-
 .export-button {
   width: 180px;
 }
 
 .freeze-button-group {
   width: 180px;
+  height: auto;
   col-between: 4px;
 }
 
@@ -106,16 +116,46 @@
   width: 88px;
 }
 
-.export-group {
-  row-between: 5px;
-  height: auto;
-}
-
 .export-status {
   color: #8e8e95;
   left: 140px;
   right: 0px;
   height: auto;
+}
+
+/* Threshold/curve controls. */
+.curve-matching-button-group {
+  width: 180px;
+  height: auto;
+  col-between: 4px;
+}
+
+.threshold-curve-button {
+  width: 88px;
+  background-color: #3a3a3a;
+}
+
+.curve-preset-control-group {
+  width: 180px;
+  height: auto;
+  col-between: 4px;
+}
+
+.curve-preset-button {
+  width: 48px;
+  background-color: #3a3a3a;
+  child-left: 5px;
+  child-right: 5px;
+}
+
+.threshold-slider-group {
+  width: 180px;
+  height: auto;
+  col-between: 4px;
+}
+
+.threshold-slider {
+  width: 88px;
 }
 
 /* Parameter sliders. */
@@ -139,6 +179,37 @@ param-slider .value-entry .caret {
 }
 param-slider .value-entry .selection {
   background-color: #ffffff30;
+}
+
+.fft-window-group {
+  width: 180px;
+  height: auto;
+  col-between: 4px;
+}
+
+.fft-window-slider {
+  width: 88px;
+}
+
+tooltip {
+  child-space: 6px;
+  background-color: #1a1a1e;
+  color: #ffffff;
+  border-width: 1px;
+  border-color: #505055;
+  border-radius: 3px;
+  width: 260px;
+  opacity: 0;
+  transition: opacity 100ms 500ms;
+}
+
+tooltip.vis {
+  opacity: 1;
+  transition: opacity 100ms 500ms;
+}
+
+tooltip label {
+  color: #ffffff;
 }
 
 /* Parameter buttons. */
@@ -212,6 +283,67 @@ picklist.mode-picklist popup list label:hover {
 }
 
 picklist.mode-picklist popup list label:checked {
+  color: #ffffff;
+  background-color: #4a4a50;
+}
+
+picklist.curve-preset-picklist {
+  width: 76px;
+  height: 30px;
+}
+
+picklist.curve-preset-picklist dropdown {
+  width: 76px;
+  height: 30px;
+  border-width: 1px;
+  border-color: #3a3a3a;
+  border-radius: 0px;
+  background-color: transparent;
+}
+
+picklist.curve-preset-picklist dropdown:hover,
+picklist.curve-preset-picklist dropdown:checked {
+  background-color: #ffffff0d;
+}
+
+picklist.curve-preset-picklist dropdown .title {
+  child-left: 4px;
+  child-right: 4px;
+}
+
+picklist.curve-preset-picklist dropdown .title label {
+  width: 54px;
+  child-top: 1s;
+  child-bottom: 1s;
+  overflow: hidden;
+}
+
+picklist.curve-preset-picklist dropdown .title .icon {
+  width: auto;
+  color: #696969;
+}
+
+picklist.curve-preset-picklist popup {
+  width: 180px;
+  border-width: 1px;
+  border-color: #3a3a3a;
+  border-radius: 0px;
+  background-color: #232323;
+}
+
+picklist.curve-preset-picklist popup scrollview {
+  child-right: 0px;
+}
+
+picklist.curve-preset-picklist popup list label {
+  color: #b8b8bf;
+}
+
+picklist.curve-preset-picklist popup list label:hover {
+  background-color: #ffffff14;
+}
+
+picklist.curve-preset-picklist popup list label:checked {
   color: #ffffff;
   background-color: #4a4a50;
 }

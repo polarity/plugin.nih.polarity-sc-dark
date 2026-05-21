@@ -104,12 +104,7 @@ impl DryWetMixer {
     ///
     /// Panics if the buffer is larger than the maximum block size, if the latency is larger than
     /// the maximum latency, or if the channel counts don't match.
-    pub fn mix_in_dry(
-        &mut self,
-        buffer: &mut Buffer,
-        ratio: f32,
-        latency: usize,
-    ) {
+    pub fn mix_in_dry(&mut self, buffer: &mut Buffer, ratio: f32, latency: usize) {
         if buffer.channels() == 0 {
             return;
         }

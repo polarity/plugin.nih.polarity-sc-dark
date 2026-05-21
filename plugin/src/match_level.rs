@@ -202,9 +202,7 @@ pub(crate) fn calculate_match_output_gain(
 
     let input_mean_square = input_energy / value_count as f64;
     let output_mean_square = output_energy / value_count as f64;
-    if input_mean_square <= SILENCE_FLOOR
-        || output_mean_square <= SILENCE_FLOOR
-    {
+    if input_mean_square <= SILENCE_FLOOR || output_mean_square <= SILENCE_FLOOR {
         return None;
     }
 

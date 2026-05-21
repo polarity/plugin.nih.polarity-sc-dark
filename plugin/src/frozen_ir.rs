@@ -38,9 +38,7 @@ impl Default for FrozenIrData {
             window_size: 0,
             overlap_times: 0,
             num_channels: 0,
-            gain_difference_db: std::array::from_fn(|_| {
-                vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1]
-            }),
+            gain_difference_db: std::array::from_fn(|_| vec![0.0; crate::MAX_WINDOW_SIZE / 2 + 1]),
         }
     }
 }
@@ -92,8 +90,8 @@ pub fn write_frozen_ir_wav(snapshot: &FrozenIrData, path: &Path) -> Result<(), S
         sample_format: SampleFormat::Float,
     };
 
-    let mut writer = WavWriter::create(path, spec)
-        .map_err(|err| format!("{}: {err}", path.display()))?;
+    let mut writer =
+        WavWriter::create(path, spec).map_err(|err| format!("{}: {err}", path.display()))?;
     for sample_idx in 0..rendered[0].len() {
         for channel in rendered.iter().take(snapshot.num_channels) {
             writer
