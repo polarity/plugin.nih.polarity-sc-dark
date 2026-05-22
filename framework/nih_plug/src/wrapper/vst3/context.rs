@@ -1,7 +1,6 @@
 use atomic_refcell::AtomicRefMut;
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use vst3_sys::vst::IComponentHandler;
 
@@ -161,23 +160,25 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
         match &*self.inner.component_handler.borrow() {
             Some(handler) => match self.inner.param_ptr_to_hash.get(&param) {
                 Some(hash) => {
-                    // Only update the parameters manually if the host is not processing audio. If
-                    // the plugin is currently processing audio, the host will pass this change back
-                    // to the plugin in the audio callback. This also prevents the values from
-                    // changing in the middle of the process callback, which would be unsound.
-                    // FIXME: So this doesn't work for REAPER, because they just silently stop
-                    //        processing audio when you bypass the plugin. Great. We can add a time
-                    //        based heuristic to work around this in the meantime.
-                    if !self.inner.is_processing.load(Ordering::SeqCst) {
-                        self.inner.set_normalized_value_by_hash(
-                            *hash,
-                            normalized,
-                            self.inner
-                                .current_buffer_config
-                                .load()
-                                .map(|c| c.sample_rate),
-                        );
-                    }
+                    // Always apply the GUI-initiated parameter change directly to the plugin in
+                    // addition to notifying the host via `perform_edit`. The original nih-plug
+                    // behaviour skipped this while the audio thread was processing and relied on
+                    // the host to echo the change back through the next process call's input
+                    // parameter changes. That is unreliable in practice: REAPER silently stops
+                    // processing audio while a plugin is bypassed, and Cubase does not echo back
+                    // changes for parameters that it considers read-only or cached. The result is
+                    // that GUI edits never reach the plugin and the editor's view of the
+                    // parameter state becomes desynchronised. Writing the new value here is safe
+                    // because all built in parameter types use atomic storage, and the host will
+                    // still receive the change through `perform_edit` to record automation.
+                    self.inner.set_normalized_value_by_hash(
+                        *hash,
+                        normalized,
+                        self.inner
+                            .current_buffer_config
+                            .load()
+                            .map(|c| c.sample_rate),
+                    );
 
                     handler.perform_edit(*hash, normalized as f64);
                 }
